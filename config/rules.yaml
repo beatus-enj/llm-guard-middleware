@@ -1,0 +1,25 @@
+# LLM Guard - 自定义规则配置（会与内置规则合并）
+# 使用单引号避免 YAML 转义问题
+
+injection_patterns:
+  - 'decode\s+this\s+base64\s+and\s+follow'
+  - 'base64\s+encoded\s+instructions?'
+  - 'maintenance\s+mode'
+  - 'i\s+am\s+(the\s+)?(developer|admin|owner|creator|anthropic|openai)'
+
+harmful_patterns:
+  - 'doxx(ing)?\s+(someone|a\s+person|them)'
+  - '(create|generate|make)\s+.{0,20}(phishing|scam)\s+(email|page|site)'
+  - 'credit\s+card\s+(skimmer|cloner|carding)'
+
+harmful_keywords:
+  - "napalm recipe"
+  - "thermite mixture"
+  - "make sarin"
+
+injection_keywords:
+  - "new instructions"
+  - "system override"
+  - "bypass your training"
+  - "your real instructions"
+  - "hidden prompt"
