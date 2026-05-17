@@ -1,0 +1,10 @@
+global:
+  scrape_interval: 5s       # 5秒抓取一次，Grafana 曲线平滑
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: llm-guard
+    static_configs:
+      - targets: ['llm-guard:8000']
+    metrics_path: /metrics
+    scrape_timeout: 4s

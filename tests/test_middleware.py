@@ -1,6 +1,5 @@
 """
 测试套件
-确保已安装pytest: python -m pip install pytest
 运行: python -m pytest tests/ -v
  或: python tests/test_middleware.py   (快速演示)
 """
