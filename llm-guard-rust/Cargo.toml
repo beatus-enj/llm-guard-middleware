@@ -1,0 +1,17 @@
+[package]
+name = "llm_guard_rust" # 编译后在 Python 里的 import 名称
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "llm_guard_rust"
+crate-type = ["cdylib"] # 必须指定
+
+[dependencies]
+regex = "1.10"
+aho-corasick = "1.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+# 添加 pyo3 依赖
+pyo3 = { version = "0.21", features = ["extension-module", "abi3-py37"] }
+log = "0.4"        

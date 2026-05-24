@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
 """启动入口 - python run.py"""
+"""
+run.py v3 — FastAPI + uvicorn 启动入口
+Step 3 改动：  
+新: from app.main import app      uvicorn.run(...)       # 生产级 ASGI 服务器      
+# start_watcher 已移入 lifespan，自动触发
+"""
 import logging
-from app.config import Settings
-from app.main import app, start_watcher, settings as app_settings
+import uvicorn
+from app.main import app, settings
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s")
-    logger = logging.getLogger("llm-guard")
-    logger.info("🛡️  LLM Guard Middleware v2 启动")
-    logger.info(f"   上游: {app_settings.UPSTREAM_URL}")
-    logger.info(f"   监听: http://{app_settings.HOST}:{app_settings.PORT}")
-    logger.info(f"   规则引擎: {'✅' if app_settings.ENABLE_RULE_ENGINE else '❌'}")
-    logger.info(f"   ML模型: {'✅' if app_settings.ENABLE_ML_MODEL else '❌'}")
-    logger.info(f"   流式审核: {'✅' if app_settings.ENABLE_STREAM_GUARD else '❌'}")
-    logger.info(f"   热更新: {'✅' if app_settings.ENABLE_HOT_RELOAD else '❌'}")
-    logger.info(f"   Prometheus: http://{app_settings.HOST}:{app_settings.PORT}/metrics")
-    logger.info(f"   Grafana:    http://localhost:3000  (docker-compose)")
-
-    # 启动热更新监控（仅在真实运行时，不在测试时）
-    start_watcher()
-
-    app.run(host=app_settings.HOST, port=app_settings.PORT,
-            debug=False, threaded=True)
+if __name__ == "__main__":    
+    logging.basicConfig(        
+        level=logging.INFO,        
+        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",    
+    )    
+    uvicorn.run(        
+        "app.main:app",        
+        host=settings.HOST,        
+        port=settings.PORT,        
+        workers=1,           # 多核生产环境: workers=4        
+        reload=False,        # 开发时可改 True（与 lifespan 兼容性较差）        
+        log_level="info",        
+        access_log=False,    # 用中间件自己的日志    
+    )
