@@ -1,12 +1,20 @@
-# 核心依赖（flask/requests/pyyaml/python-dotenv 通常已预装）
-flask>=3.0.0
-requests>=2.28.0
-pyyaml>=6.0
-python-dotenv>=1.0.0
-
-# 测试
-pytest>=7.0.0
-
-# ML 模型（可选，ENABLE_ML_MODEL=true 时需要）
-# pip install transformers torch
-# 仅 CPU 推理可改用: pip install transformers torch --index-url https://download.pytorch.org/whl/cpu
+annotated-doc==0.0.4
+annotated-types==0.7.0
+anyio==4.13.0
+certifi==2026.5.20
+click==8.4.1
+dotenv==0.9.9
+exceptiongroup==1.3.1
+fastapi==0.136.3
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.16
+-e git+https://github.com/beatus-enj/llm-guard-middleware.git@dd110f2507eda91eea399d4ea628b11b5434a252#egg=llm_guard_rust
+pydantic==2.13.4
+pydantic_core==2.46.4
+python-dotenv==1.2.2
+starlette==1.1.0
+typing-inspection==0.4.2
+typing_extensions==4.15.0
+uvicorn==0.47.0
