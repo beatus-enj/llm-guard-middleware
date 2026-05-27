@@ -9,7 +9,7 @@ h11==0.16.0
 httpcore==1.0.9
 httpx==0.28.1
 idna==3.16
--e git+https://github.com/beatus-enj/llm-guard-middleware.git@dd110f2507eda91eea399d4ea628b11b5434a252#egg=llm_guard_rust
+# -e git+https://github.com/beatus-enj/llm-guard-middleware.git@dd110f2507eda91eea399d4ea628b11b5434a252#egg=llm_guard_rust
 pydantic==2.13.4
 pydantic_core==2.46.4
 python-dotenv==1.2.2
