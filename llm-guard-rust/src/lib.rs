@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyValueError, PyIOError};
 use pyo3::types::PyDict;
 use regex::Regex;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
@@ -10,7 +10,7 @@ use std::sync::{Arc, RwLock};
 use serde::Deserialize;
 
 // ════════════════════════════════════════════════════════════════════════════
-//  内置静态规则常量 (100% 对齐原 Python 预置库)
+//  内置静态规则常量 (新增 DATA EXFILTRATION 过滤器矩阵)
 // ════════════════════════════════════════════════════════════════════════════
 
 const DEFAULT_INJECTION_PATTERNS: &[&str] = &[
@@ -75,6 +75,14 @@ const DEFAULT_HARMFUL_PATTERNS: &[&str] = &[
     r"黑客\s*(攻击|入侵|破解)\s*(方法|教程|步骤)",
 ];
 
+// 🚀 新增：确定性数据泄露过滤正则（防止大模型侧道外泄敏感资产、凭证或隐私）
+const DEFAULT_EXFILTRATION_PATTERNS: &[&str] = &[
+    r"\bsk-[a-zA-Z0-9]{48}\b",                                 // OpenAI API Key
+    r"AIza[0-9A-Za-z-_]{35}",                                  // Google Cloud API Key
+    r"\b[45][0-9]{3}[- ]?[0-9]{4}[- ]?[0-9]{4}[- ]?[0-9]{4}\b", // Visa/MasterCard 信用卡
+    r"\b[1-9][0-9]{5}(18|19|20)[0-9]{2}((0[1-9])|(1[0-2]))(([0-2][1-9])|10|20|30|31)[0-9]{3}[0-9Xx]\b", // 中国身份证
+];
+
 const DEFAULT_HARMFUL_KEYWORDS: &[&str] = &[
     "child pornography", "child sexual abuse", "csam",
     "how to make c4", "how to make ricin", "how to make anthrax",
@@ -92,6 +100,11 @@ const DEFAULT_INJECTION_KEYWORDS: &[&str] = &[
     "hidden prompt", "system override",
 ];
 
+// 🚀 新增：确定性数据泄露敏感词
+const DEFAULT_EXFILTRATION_KEYWORDS: &[&str] = &[
+    "INTERNAL_ONLY", "CLASSIFIED_DOC", "sk-ant-", "PRIVATE_KEY", "BEGIN RSA PRIVATE KEY",
+];
+
 // ════════════════════════════════════════════════════════════════════════════
 //  配置解析与编译逻辑
 // ════════════════════════════════════════════════════════════════════════════
@@ -100,8 +113,10 @@ const DEFAULT_INJECTION_KEYWORDS: &[&str] = &[
 struct CustomRules {
     injection_patterns: Option<Vec<String>>,
     harmful_patterns: Option<Vec<String>>,
+    exfiltration_patterns: Option<Vec<String>>, // 新增
     injection_keywords: Option<Vec<String>>,
     harmful_keywords: Option<Vec<String>>,
+    exfiltration_keywords: Option<Vec<String>>, // 新增
 }
 
 struct InnerRules {
@@ -111,6 +126,9 @@ struct InnerRules {
     harm_ac: Option<AhoCorasick>,
     harm_keywords: Vec<String>,
     harm_regex: Option<Regex>,
+    exfil_ac: Option<AhoCorasick>,         // 新增
+    exfil_keywords: Vec<String>,         // 新增
+    exfil_regex: Option<Regex>,           // 新增
     total_count: usize,
 }
 
@@ -130,81 +148,77 @@ fn compile_rules(config_path: &str) -> Result<InnerRules, String> {
     if let Some(mut extra) = custom.injection_keywords { inj_kw.append(&mut extra); }
     let mut harm_kw: Vec<String> = DEFAULT_HARMFUL_KEYWORDS.iter().map(|s| s.to_string()).collect();
     if let Some(mut extra) = custom.harmful_keywords { harm_kw.append(&mut extra); }
+    
+    let mut exfil_kw: Vec<String> = DEFAULT_EXFILTRATION_KEYWORDS.iter().map(|s| s.to_string()).collect();
+    if let Some(mut extra) = custom.exfiltration_keywords { exfil_kw.append(&mut extra); }
 
     let mut inj_p: Vec<String> = DEFAULT_INJECTION_PATTERNS.iter().map(|s| s.to_string()).collect();
     if let Some(mut extra) = custom.injection_patterns { inj_p.append(&mut extra); }
     let mut harm_p: Vec<String> = DEFAULT_HARMFUL_PATTERNS.iter().map(|s| s.to_string()).collect();
     if let Some(mut extra) = custom.harmful_patterns { harm_p.append(&mut extra); }
+    
+    let mut exfil_p: Vec<String> = DEFAULT_EXFILTRATION_PATTERNS.iter().map(|s| s.to_string()).collect();
+    if let Some(mut extra) = custom.exfiltration_patterns { exfil_p.append(&mut extra); }
 
-    let total_count = inj_kw.len() + harm_kw.len() + inj_p.len() + harm_p.len();
+    let total_count = inj_kw.len() + harm_kw.len() + exfil_kw.len() + inj_p.len() + harm_p.len() + exfil_p.len();
 
     let inj_ac = AhoCorasickBuilder::new().ascii_case_insensitive(true).build(&inj_kw).ok();
     let harm_ac = AhoCorasickBuilder::new().ascii_case_insensitive(true).build(&harm_kw).ok();
+    
+    let exfil_ac = AhoCorasickBuilder::new().ascii_case_insensitive(true).build(&exfil_kw).ok();
 
-    // 使用 (?is) 对应 Python 中的 re.IGNORECASE | re.DOTALL
-    let inj_regex = if !inj_p.is_empty() {
-        let joined = inj_p.iter().map(|p| format!("(?:{})", p)).collect::<Vec<_>>().join("|");
-        Regex::new(&format!("(?is){}", joined)).ok()
-    } else { None };
+    let compile_regex = |patterns: Vec<String>| -> Option<Regex> {
+    if patterns.is_empty() { return None; }
+    let joined = patterns.iter().map(|p| format!("(?:{})", p)).collect::<Vec<_>>().join("|");
+    Regex::new(&format!("(?is){}", joined)).ok()
+    };
 
-    let harm_regex = if !harm_p.is_empty() {
-        let joined = harm_p.iter().map(|p| format!("(?:{})", p)).collect::<Vec<_>>().join("|");
-        Regex::new(&format!("(?is){}", joined)).ok()
-    } else { None };
-
-    Ok(InnerRules { inj_ac, inj_keywords: inj_kw, inj_regex, harm_ac, harm_keywords: harm_kw, harm_regex, total_count })
+    Ok(InnerRules {
+        inj_ac, inj_keywords: inj_kw, inj_regex: compile_regex(inj_p),
+        harm_ac, harm_keywords: harm_kw, harm_regex: compile_regex(harm_p),
+        exfil_ac, exfil_keywords: exfil_kw, exfil_regex: compile_regex(exfil_p),
+        total_count,
+    })
 }
 
 impl InnerRules {
     fn check_text<'py>(&self, py: Python<'py>, text: &str) -> PyResult<Bound<'py, PyDict>> {
         let dict = PyDict::new_bound(py);
 
-        // 1. 注入关键词
+        // 1. 提示词注入关键词快速路径
         if let Some(ref ac) = self.inj_ac {
             if let Some(mat) = ac.find(text) {
-                let kw = &self.inj_keywords[mat.pattern().as_usize()];
-                dict.set_item("blocked", true)?;
-                dict.set_item("threat_type", "prompt_injection")?;
-                dict.set_item("reason", format!("关键词匹配: '{}'", kw))?;
-                dict.set_item("source", "rule_engine")?;
-                dict.set_item("score", 1.0)?;
-                return Ok(dict);
+                return self.build_blocked_dict(dict, "prompt_injection", format!("关键词匹配: '{}'", &self.inj_keywords[mat.pattern().as_usize()]));
             }
         }
-        // 2. 注入正则
+        // 2. 提示词注入正则路径
         if let Some(ref re) = self.inj_regex {
             if let Some(mat) = re.find(text) {
-                let snippet: String = mat.as_str().chars().take(50).collect();
-                dict.set_item("blocked", true)?;
-                dict.set_item("threat_type", "prompt_injection")?;
-                dict.set_item("reason", format!("注入正则命中: '{}'", snippet))?;
-                dict.set_item("source", "rule_engine")?;
-                dict.set_item("score", 1.0)?;
-                return Ok(dict);
+                return self.build_blocked_dict(dict, "prompt_injection", format!("注入正则命中: '{}'", mat.as_str().chars().take(40).collect::<String>()));
             }
         }
-        // 3. 有害关键词
+        // 3. 数据泄露关键词反向路径 (Exfiltration Filter)
+        if let Some(ref ac) = self.exfil_ac {
+            if let Some(mat) = ac.find(text) {
+                return self.build_blocked_dict(dict, "data_exfiltration", format!("敏感资产外泄关键词: '{}'", &self.exfil_keywords[mat.pattern().as_usize()]));
+            }
+        }
+        // 4. 数据泄露正则路径
+        if let Some(ref re) = self.exfil_regex {
+            if let Some(mat) = re.find(text) {
+                return self.build_blocked_dict(dict, "data_exfiltration", format!("敏感资产凭证外泄: '{}'", mat.as_str().chars().take(40).collect::<String>()));
+            }
+        }
+        // 5. 有害内容关键词路径
         if let Some(ref ac) = self.harm_ac {
             if let Some(mat) = ac.find(text) {
-                let kw = &self.harm_keywords[mat.pattern().as_usize()];
-                dict.set_item("blocked", true)?;
-                dict.set_item("threat_type", "harmful_content")?;
-                dict.set_item("reason", format!("有害关键词: '{}'", kw))?;
-                dict.set_item("source", "rule_engine")?;
-                dict.set_item("score", 1.0)?;
-                return Ok(dict);
+                return self.build_blocked_dict(dict, "harmful_content", format!("有害关键词: '{}'", &self.harm_keywords[mat.pattern().as_usize()]));
             }
         }
-        // 4. 有害正则
+        // 6. 有害内容正则路径
         if let Some(ref re) = self.harm_regex {
             if let Some(mat) = re.find(text) {
-                let snippet: String = mat.as_str().chars().take(50).collect();
-                dict.set_item("blocked", true)?;
-                dict.set_item("threat_type", "harmful_content")?;
-                dict.set_item("reason", format!("有害内容正则命中: '{}'", snippet))?;
-                dict.set_item("source", "rule_engine")?;
-                dict.set_item("score", 1.0)?;
-                return Ok(dict);
+                return self.build_blocked_dict(dict, "harmful_content", format!("有害内容正则命中: '{}'", mat.as_str().chars().take(40).collect::<String>()));
             }
         }
 
@@ -213,7 +227,18 @@ impl InnerRules {
         dict.set_item("score", 0.0)?;
         Ok(dict)
     }
+
+    #[inline]
+    fn build_blocked_dict<'py>(&self, dict: Bound<'py, PyDict>, threat_type: &str, reason: String) -> PyResult<Bound<'py, PyDict>> {
+        dict.set_item("blocked", true)?;
+        dict.set_item("threat_type", threat_type)?;
+        dict.set_item("reason", reason)?;
+        dict.set_item("source", "rule_engine")?;
+        dict.set_item("score", 1.0)?;
+        Ok(dict)
+    }
 }
+
 
 // ════════════════════════════════════════════════════════════════════════════
 //  PyO3 导出类与模块接口
@@ -258,10 +283,8 @@ impl PyRuleEngine {
     pub fn new_stream_guard(&self) -> PyStreamGuard {
         PyStreamGuard {
             rules: Arc::clone(&self.rules),
-            buffer: String::new(),
+            buffer: String::with_capacity(2048),
             blocked: false,
-            block_result: None,
-            chunk_window: 200,
         }
     }
 }
@@ -271,64 +294,72 @@ pub struct PyStreamGuard {
     rules: Arc<RwLock<InnerRules>>,
     buffer: String,
     blocked: bool,
-    block_result: Option<PyObject>,
-    chunk_window: usize,
 }
 
 #[pymethods]
 impl PyStreamGuard {
-    pub fn feed<'py>(&mut self, py: Python<'py>, chunk: &str) -> PyResult<(bool, Option<Bound<'py, PyDict>>)> {
+     /// 💡 核心升级：逐 Token 喂入数据时立即进行内联检测。
+    /// 一旦命中规则，直接抛出 PyIOError(UnexpectedEof)，从底层强行截断网络流。
+    pub fn feed(&mut self, py: Python<'_>, chunk: &str) -> PyResult<()> {
         if self.blocked {
-            if let Some(ref res) = self.block_result {
-                return Ok((true, Some(res.bind(py).downcast::<PyDict>()?.clone())));
-            }
-            return Ok((true, None));
+            return Err(PyIOError::new_err("UnexpectedEof: Link already terminated by inline mitigation."));
         }
 
         self.buffer.push_str(chunk);
 
-        if self.buffer.chars().count() >= self.chunk_window {
-            let guard = self.rules.read().unwrap();
-            let result = guard.check_text(py, &self.buffer)?;
-            self.buffer.clear();
+        // 旁路内联轻量级审查
+        let guard = self.rules.read().unwrap();
+        let result = guard.check_text(py, &self.buffer)?;
+        
+        let is_blocked: bool = result.get_item("blocked")?.unwrap().extract()?;
+        if is_blocked {
+            self.blocked = true;
+            let threat_type: String = result.get_item("threat_type")?.unwrap().extract()?;
+            let reason: String = result.get_item("reason")?.unwrap().extract()?;
+            
+            // 🚨 触发网关级确定性熔断断流，向上层抛出 UnexpectedEof 标记的 IO 异常
+            return Err(PyIOError::new_err(format!(
+                "UnexpectedEof: Inline Threat Mitigation Triggered. Type: [{}], Reason: [{}]",
+                threat_type, reason
+            )));
+        }
 
-            let is_blocked: bool = result.get_item("blocked")?.unwrap().extract()?;
-            if is_blocked {
-                self.blocked = true;
-                self.block_result = Some(result.to_object(py));
-                return Ok((true, Some(result)));
+        // 🔄 真正的滑动窗口维持：防止大流长文本导致内存膨胀，同时保留末尾 500 个字符保证跨 Chunk 语义连续
+        let char_count = self.buffer.chars().count();
+        if char_count > 1000 {
+            let drain_amount = char_count - 500;
+            if let Some((byte_idx, _)) = self.buffer.char_indices().nth(drain_amount) {
+                self.buffer.drain(0..byte_idx);
             }
         }
-        Ok((false, None))
+        Ok(())
     }
 
-    pub fn flush<'py>(&mut self, py: Python<'py>) -> PyResult<(bool, Option<Bound<'py, PyDict>>)> {
+    /// 流结束时清洗残留缓冲区
+    pub fn flush(&mut self, py: Python<'_>) -> PyResult<()> {
         if self.blocked {
-            if let Some(ref res) = self.block_result {
-                return Ok((true, Some(res.bind(py).downcast::<PyDict>()?.clone())));
-            }
-            return Ok((true, None));
+            return Err(PyIOError::new_err("UnexpectedEof: Link already terminated."));
         }
-
         if self.buffer.trim().is_empty() {
-            return Ok((false, None));
+            return Ok(());
         }
 
         let guard = self.rules.read().unwrap();
         let result = guard.check_text(py, &self.buffer)?;
-        self.buffer.clear();
-
         let is_blocked: bool = result.get_item("blocked")?.unwrap().extract()?;
         if is_blocked {
             self.blocked = true;
-            self.block_result = Some(result.to_object(py));
-            return Ok((true, Some(result)));
+            let threat_type: String = result.get_item("threat_type")?.unwrap().extract()?;
+            return Err(PyIOError::new_err(format!("UnexpectedEof: Flush Isolation. Type: [{}]", threat_type)));
         }
-        Ok((false, None))
+        self.buffer.clear();
+        Ok(())
     }
 
     #[getter]
-    pub fn is_blocked(&self) -> bool { self.blocked }
+    pub fn is_blocked(&self) -> bool {
+        self.blocked
+    }
 }
 
 #[pymodule]
