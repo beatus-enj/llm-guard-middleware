@@ -15,6 +15,7 @@ import time
 from contextlib import asynccontextmanager
 
 import httpx
+import uvicorn
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
@@ -36,6 +37,7 @@ detector    = ContentDetector(settings)
 metrics     = get_metrics()
 alerter     = AsyncAlertManager(settings)   # Step 4: 原 AlertManager(settings)
 _watcher    = None
+_main_loop = None  # 🟢 修复 Bug：用于暂存主事件循环的引用的全局变量
 _start_time = time.time()
 
 
@@ -43,19 +45,18 @@ _start_time = time.time()
 
 def _on_rule_reload():
     """
-    v3 alerter 是异步的，run_coroutine_threadsafe 桥接到主事件循环。
+    watchdog 线程回调。
+    通过全局缓存的 _main_loop 确保安全地将异步告警任务桥接到主主事件循环中。
     """
     success, count, err = detector.hot_reload()
     metrics.record_rule_reload(count if success else 0)
     metrics.set_gauge("rule_count", float(count))
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.run_coroutine_threadsafe(
-                alerter.notify_rule_reload(success, count, err), loop
-            )
-    except RuntimeError:
-        pass
+     # 🟢 修复：不再依赖线程本地的 get_event_loop()，改用主线程留下的句柄
+    if _main_loop and _main_loop.is_running():
+        asyncio.run_coroutine_threadsafe(
+            alerter.notify_rule_reload(success, count, err), _main_loop
+        )
+
 
 
 # ── Step 3: lifespan（替代分散的 start_watcher() + daemon线程）──────────────
@@ -67,7 +68,9 @@ async def lifespan(app: FastAPI):
       - yield 前：启动告警 Task、文件监控
       - yield 后：cancel Task、stop watcher（资源确保释放）
     """
-    global _watcher
+    global _watcher, _main_loop
+    # 🟢 修复：在主线程的 lifespan 中捕获当前运行的 asyncio 事件循环
+    _main_loop = asyncio.get_running_loop()
 
     # 1. 告警后台协程（替代 daemon 线程）
     alert_task = asyncio.create_task(alerter.worker_loop(), name="alert-worker")
@@ -83,7 +86,7 @@ async def lifespan(app: FastAPI):
     metrics.set_gauge("rule_count", float(detector.rule_count))
     metrics.set_gauge("ml_model_loaded", 1.0 if detector.model_loaded else 0.0)
 
-    logger.info("🛡️  LLM Guard Middleware v3 (FastAPI) 启动")
+    logger.info("🛡️  LLM Guard Middleware v3 (FastAPI) 启动成功并进入全时内联监视状态")
     logger.info(f"   上游:     {settings.UPSTREAM_URL}")
     logger.info(f"   规则数:   {detector.rule_count} 条")
     logger.info(f"   流式审核: {'✅' if settings.ENABLE_STREAM_GUARD else '❌'}")
@@ -168,7 +171,7 @@ def _block_ratio() -> float:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Step 2: 改代理 — requests → httpx.AsyncClient
+#  代理核心与流式截断控制
 # ════════════════════════════════════════════════════════════════════════════
 
 async def proxy_upstream(request: Request, path: str):
@@ -230,7 +233,8 @@ def _extract_sse_text(chunk_bytes: bytes) -> str:
 
 async def proxy_upstream_stream(request: Request, path: str, body: dict):
     """
-    v3:  httpx client.stream() + async for chunk in resp.aiter_bytes()
+    流式代理：对 SSE 逐 chunk 做内容审核
+    内联威胁缓解：一旦违反安全规则，立刻发起物理级硬熔断，确保 0-Day 漏洞碎片被完全隔离
     """
     upstream_url = f"{settings.UPSTREAM_URL}/{path.lstrip('/')}"
     excluded = {"host", "transfer-encoding", "connection", "keep-alive"}
@@ -249,24 +253,36 @@ async def proxy_upstream_stream(request: Request, path: str, body: dict):
                             text_piece = _extract_sse_text(chunk)
                             if text_piece:
                                 blocked, result = stream_guard.feed(text_piece)
-                                metrics.record_stream_chunk(blocked=blocked)
+                                # metrics.record_stream_chunk(blocked=blocked)
                                 if blocked:
-                                    block_event = json.dumps({
-                                        "id": "chatcmpl-guard-stream-blocked",
-                                        "object": "chat.completion.chunk",
-                                        "choices": [{"index": 0,
-                                                     "delta": {"content": settings.SAFE_REPLY_MESSAGE},
-                                                     "finish_reason": "stop"}],
-                                        "_guard": {"blocked": True,
-                                                   "threat_type": result.get("threat_type"),
-                                                   "reason": result.get("reason")}
-                                    })
-                                    yield f"data: {block_event}\n\ndata: [DONE]\n\n".encode()
+                                    # block_event = json.dumps({
+                                    #     "id": "chatcmpl-guard-stream-blocked",
+                                    #     "object": "chat.completion.chunk",
+                                    #     "choices": [{"index": 0,
+                                    #                  "delta": {"content": settings.SAFE_REPLY_MESSAGE},
+                                    #                  "finish_reason": "stop"}],
+                                    #     "_guard": {"blocked": True,
+                                    #                "threat_type": result.get("threat_type"),
+                                    #                "reason": result.get("reason")}
+                                    # })
+                                    # yield f"data: {block_event}\n\ndata: [DONE]\n\n".encode()
+                                    # logger.warning(
+                                    #     f"🚫 流式拦截 | {result.get('threat_type')} | "
+                                    #     f"{result.get('reason','')[:60]}"
+                                    # )
+                                    # return
                                     logger.warning(
-                                        f"🚫 流式拦截 | {result.get('threat_type')} | "
-                                        f"{result.get('reason','')[:60]}"
+                                        f"🚨 [Inline Mitigation] 安全规则流式熔断! "
+                                        f"类型: {result.get('threat_type')}, 原因: {result.get('reason','')[:60]}"
                                     )
-                                    return
+                                    # 异步派发告警任务（Fire-and-forget，绝不阻塞当前断流核心周期）
+                                    asyncio.create_task(alerter.check_and_alert(result, _block_ratio()))
+                                    
+                                    # 【硬截断核心】引发底层连接重置，中断 ASGI 容器 Chunk 生命周期，
+                                    # 导致下游客户端在协议层捕获类似 io.ErrUnexpectedEOF 的非正常流终止异常。
+                                    raise ConnectionResetError(
+                                        "Inline Threat Mitigation: Zero-day exploit isolated immediately via hard termination."
+                                    )
                             else:
                                 metrics.record_stream_chunk(blocked=False)
                         yield chunk
@@ -275,6 +291,14 @@ async def proxy_upstream_stream(request: Request, path: str, body: dict):
                 blocked, result = stream_guard.flush()
                 if blocked:
                     metrics.record_stream_chunk(blocked=True)
+                    logger.warning(f"🚨 [Inline Mitigation] Flush 阶段触发拦截! 类型: {result.get('threat_type')}")
+                    asyncio.create_task(alerter.check_and_alert(result, _block_ratio()))
+                    raise ConnectionResetError(
+                        "Inline Threat Mitigation: Flush phase termination."
+                    )
+        except ConnectionResetError as e:
+            # 必须单独捕获并向上层抛出，防止被下方的 Exception 拦截而下发格式化的错误 JSON
+            raise e
 
         except Exception as e:
             metrics.record_error()

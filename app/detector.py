@@ -4,6 +4,7 @@ detector.py — 高性能内容检测引擎 v2 (Rust 混合重构版)
 """
 import time
 import logging
+import re
 from typing import Tuple, Optional, Dict, Any
 
 # 导入 Rust 编译的原生二进制扩展模块
@@ -13,28 +14,91 @@ logger = logging.getLogger("llm-guard.detector")
 
 class RustStreamGuardProxy:    
     """    
-    流式响应审核器代理（100% 契合原 StreamGuard 接口）。    
+    流式响应审核器代理    
     底层的数据积攒窗口与多模式匹配完全在 Rust 中以二进制速度处理。    
+    现在结合 Rust 核心的内联异常熔断机制，实现数据到达客户端屏幕前的零日隔离。
     """    
     def __init__(self, raw_rust_guard: llm_guard_rust.PyStreamGuard):        
         self._inner = raw_rust_guard
+        self._is_blocked = False
+        self._block_result = None
     
     @property    
     def is_blocked(self) -> bool:        
-        return self._inner.is_blocked
+        # 融合 Python 本地拦截状态与 Rust 底层状态
+        return self._inner.is_blocked or self._is_blocked
     
     def feed(self, chunk: str) -> Tuple[bool, Optional[Dict[str, Any]]]:        
         """        
-        喂入一个 chunk，返回 (should_block, detection_result_dict)。        
+        喂入一个 chunk，返回 (should_block, detection_result_dict)。
+        底层 Rust 核心命中规则时会抛出包含 UnexpectedEof 的 OSError。
+        此处捕获并反向解析异常文本，将其无缝转换为解包所需的标准 Python 字典。        
         """        
-        blocked, rust_res = self._inner.feed(chunk)        
-        # Rust 直接返回 PyDict，如果是 None 则不用处理        
-        return blocked, rust_res
+        if self.is_blocked:
+            return True, self._block_result
+
+        try:
+            # 🚀 快速路径：直接交付给纯 Rust 内核进行高频内联审查（无 GIL 锁开销）
+            # 正常情况下 Rust 方法返回 None (PyResult<()>)
+            self._inner.feed(chunk)
+            return False, None
+            
+        except OSError as e:
+            err_msg = str(e)
+            if "UnexpectedEof" in err_msg:
+                self._is_blocked = True
+                
+                # 从 Rust 的熔断异常中高效提取威胁元数据
+                threat_type = "unknown"
+                reason = err_msg
+                
+                type_match = re.search(r"Type:\s*\[(.*?)\]", err_msg)
+                reason_match = re.search(r"Reason:\s*\[(.*?)\]", err_msg)
+                if type_match:
+                    threat_type = type_match.group(1)
+                if reason_match:
+                    reason = reason_match.group(1)
+
+                # 完美还原字典级联解包结构
+                self._block_result = {
+                    "blocked": True,
+                    "threat_type": threat_type,
+                    "reason": reason,
+                    "source": "rule_engine",
+                    "score": 1.0
+                }
+                logger.warning(f"🛡️ [Inline Threat Mitigation] Rust 内核触发断流隔离! 类型: {threat_type}")
+                return True, self._block_result
+            
+            # 若属于其他类型的系统或 IO 异常，则继续向上抛出
+            raise e
     
     def flush(self) -> Tuple[bool, Optional[Dict[str, Any]]]:        
         """流结束时检测剩余缓冲"""        
-        blocked, rust_res = self._inner.flush()        
-        return blocked, rust_res
+        if self.is_blocked:
+            return True, self._block_result
+
+        try:
+            self._inner.flush()
+            return False, None
+        except OSError as e:
+            err_msg = str(e)
+            if "UnexpectedEof" in err_msg:
+                self._is_blocked = True
+                threat_type = "unknown"
+                type_match = re.search(r"Type:\s*\[(.*?)\]", err_msg)
+                if type_match:
+                    threat_type = type_match.group(1)
+
+                self._block_result = {
+                    "blocked": True,
+                    "threat_type": threat_type,
+                    "reason": "Flush 尾部数据清洗阶段触发隔离",
+                    "source": "rule_engine",
+                    "score": 1.0
+                }
+                return True, self._block_result
+            raise e
 
 class MLClassifier:    
     """原封不动保留 Python 侧极其成熟的 Transformers 语义识别能力"""    
