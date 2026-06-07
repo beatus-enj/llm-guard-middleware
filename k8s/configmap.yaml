@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llm-guard-config
+  namespace: llm-guard
+data:
+  # 环境变量配置
+  UPSTREAM_URL: "http://llamacpp-service:8080"
+  PORT: "8000"
+  ENABLE_RULE_ENGINE: "true"
+  ENABLE_ML_MODEL: "false"
+  ENABLE_STREAM_GUARD: "true"
+  ENABLE_HOT_RELOAD: "false"   # K8s 用 ConfigMap 更新，不需要文件监控
+  ALERT_BLOCK_RATIO_THRESHOLD: "0.5"
+
+  # rules.yaml 内容直接内嵌
+  rules.yaml: |
+    injection_patterns:
+      - 'decode\s+this\s+base64\s+and\s+follow'
+      - 'maintenance\s+mode'
+
+    injection_keywords:
+      - "system override"
+      - "bypass your training"
+      - "hidden prompt"
+
+    harmful_keywords:
+      - "napalm recipe"
+      - "thermite mixture"

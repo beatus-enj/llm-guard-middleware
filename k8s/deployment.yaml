@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-guard
+  namespace: llm-guard
+  labels:
+    app: llm-guard
+spec:
+  replicas: 2                    # 2 个副本，一个挂了还有一个
+  selector:
+    matchLabels:
+      app: llm-guard
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1                # 更新时最多多启动 1 个新 Pod
+      maxUnavailable: 0          # 更新时不允许有 Pod 不可用（零宕机）
+  template:
+    metadata:
+      labels:
+        app: llm-guard
+      annotations:
+        prometheus.io/scrape: "true"   # 告诉 Prometheus 来抓这个 Pod
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: llm-guard
+          image: llm-guard:v3
+          imagePullPolicy: Never       # 用本地镜像，不去 registry 拉
+          ports:
+            - containerPort: 8000
+          
+          # 环境变量从 ConfigMap 注入
+          envFrom:
+            - configMapRef:
+                name: llm-guard-config
+            - secretRef:
+                name: llm-guard-secret
+          
+          # rules.yaml 挂载为文件
+          volumeMounts:
+            - name: rules-volume
+              mountPath: /app/config
+              readOnly: true
+          
+          # 资源限制：防止一个 Pod 吃满节点资源
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"       # 0.1 个 CPU 核
+            limits:
+              memory: "512Mi"
+              cpu: "500m"       # 最多 0.5 个 CPU 核
+          
+          # 存活探针：失败则重启容器
+          livenessProbe:
+            httpGet:
+              path: /guard/health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          
+          # 就绪探针：失败则从 Service 摘除（不接收流量）
+          readinessProbe:
+            httpGet:
+              path: /guard/health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 2
+      
+      volumes:
+        - name: rules-volume
+          configMap:
+            name: llm-guard-config
+            items:
+              - key: rules.yaml
+                path: rules.yaml
+      
+      # 优雅关闭：SIGTERM 后等 30 秒再强杀
+      terminationGracePeriodSeconds: 30
