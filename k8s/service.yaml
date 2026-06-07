@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-guard-service
+  namespace: llm-guard
+spec:
+  selector:
+    app: llm-guard             # 匹配有这个 label 的 Pod
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP              # 集群内访问；对外暴露用 LoadBalancer 或 Ingress
+---
+# llamacpp mock 服务
+apiVersion: v1
+kind: Service
+metadata:
+  name: llamacpp-service
+  namespace: llm-guard
+spec:
+  selector:
+    app: llamacpp
+  ports:
+    - port: 8080
+      targetPort: 8080
+  type: ClusterIP
