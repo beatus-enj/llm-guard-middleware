@@ -39,7 +39,7 @@ maturin develop --release
 编译成功后，Python 环境中将可以直接 import llm_guard_rust。
 
 
-🏗️ 系统架构与流式检测原理
+## 🏗️ 系统架构与流式检测原理
 ```text
 [ 客户端请求 ]    
    │      
@@ -115,8 +115,8 @@ docker-compose up -d
 ### 运行测试
 
 ```bash
-python tests/test_v2.py
-# 输出: 49/49 通过 (100%)
+python tests/test_v3.py
+# 输出: 50/50 通过 (100%)
 ```
 
 ## API 端点
@@ -186,4 +186,63 @@ ALERT_COOLDOWN_SEC=300
 ENABLE_ML_MODEL=true
 ML_MODEL_NAME=unitary/toxic-bert   # 首次运行自动下载 ~400MB
 ML_THRESHOLD=0.7
+```
+
+## Kubernetes Deployment
+
+### Prerequisites
+
+| Tool | Version |
+|------|---------|
+| kubectl | ≥ 1.27 |
+| Docker | ≥ 24 |
+| Kubernetes cluster | ≥ 1.27 (minikube / EKS / GKE / AKS) |
+
+```bash
+kubectl version --client
+kubectl cluster-info
+kubectl get nodes
+```
+### Apply
+Apply everything at once:
+```bash
+# 一次性应用所有清单
+kubectl apply -f k8s/
+```
+
+### Verify
+```bash
+# Overview of all resources
+kubectl get all -n llm-guard
+
+# Tail logs
+kubectl logs -l app=llm-guard-middleware -n llm-guard --tail=50 -f
+
+# Port-forward for local testing
+kubectl port-forward svc/llm-guard-service 8080:80 -n llm-guard
+```
+
+```bash
+# Health check
+curl http://localhost:8080/health
+
+# Scan a prompt
+curl -X POST http://localhost:8080/scan \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-auth-token" \
+  -d '{"prompt": "Hello, how are you?"}'
+
+# Prometheus metrics
+curl http://localhost:9090/metrics
+```
+
+Expected healthy response:
+
+```json
+{
+  "status": "ok",
+  "scan_result": "pass",
+  "latency_ms": 0.8,
+  "scanners_triggered": []
+}
 ```
