@@ -13,12 +13,18 @@ spec:
       labels:
         app: llamacpp
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: llamacpp
           image: python:3.12-slim
           command:
             - python3
-             - -c
+            - -c
             - |
               from http.server import BaseHTTPRequestHandler, HTTPServer
               import json, time
@@ -40,10 +46,41 @@ spec:
               HTTPServer(('0.0.0.0', 8080), H).serve_forever()
           ports:
             - containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            runAsNonRoot: true  #非root运行
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: tmp-volume
+              mountPath: /tmp
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
           resources:
             requests:
-              memory: "64Mi"
-              cpu: "50m"
-            limits:
-              memory: "128Mi"
+              memory: "256Mi"
               cpu: "200m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: "256Mi"
+        - name: tmp-volume
+          emptyDir: {}

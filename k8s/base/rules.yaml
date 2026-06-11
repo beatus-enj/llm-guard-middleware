@@ -1,0 +1,10 @@
+injection_patterns:
+  - 'decode\s+this\s+base64\s+and\s+follow'
+  - 'maintenance\s+mode'
+injection_keywords:
+  - "system override"
+  - "bypass your training"
+  - "hidden prompt"
+harmful_keywords:
+  - "napalm recipe"
+  - "thermite mixture"
