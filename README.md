@@ -66,13 +66,13 @@ maturin develop --release
 
 | 指标 | 实测值 | 目标 |
 |------|--------|------|
-| 规则引擎 P99 延迟 | **0.06ms** | < 50ms |
+| 规则引擎 P99 延迟(n=1000)| **0.06ms** | < 50ms |
 | 规则引擎平均延迟 | **0.03ms** | < 30ms |
 | 单次检测吞吐（5000次） | **0.003ms** | < 5ms |
 | 4线程并发 P99 | **0.08ms** | < 50ms |
 | 攻击集拦截率（40样本） | **100%** | ≥ 95% |
 | 安全集误报率（20样本） | **0%** | ≤ 10% |
-| 测试通过率 | **49/49** | 100% |
+| 测试通过率 | **50/50** | 100% |
 
 ## 核心功能
 
@@ -115,7 +115,7 @@ docker-compose up -d
 ### 运行测试
 
 ```bash
-python tests/test_v3.py
+python ../tests/test_v3.py
 # 输出: 50/50 通过 (100%)
 ```
 
@@ -190,6 +190,17 @@ ML_THRESHOLD=0.7
 
 ## Kubernetes Deployment
 
+
+### 容器安全
+```text
+ 审计项	| 验证目的 | 预期正确结果 (Pass Criteria) | 状态
+UID 权限审计 |	防止容器遭遇 Root 提权	| (强制非 Root 运行)|🟢 PASS
+特权晋升审计 |	封杀 Linux 提权漏洞	    | 	false (禁止提权) | 🟢 PASS
+内核能力审计 | 剥离所有不必要的内核调用	  |[ALL] (彻底丢弃全部 Capability) |	🟢 PASS
+写缓存合规性 |	只读根文件系统下的数据暂存 |	write success (仅 /tmp 允许空目录挂载写入)	| 🟢 PASS
+配置解耦审计 | 	检查环境变量是否被大文本污染 | 	(空输出) (环境变量中不包含任何大文本规则)	|🟢 PASS
+```
+
 ### Prerequisites
 
 | Tool | Version |
@@ -206,8 +217,8 @@ kubectl get nodes
 ### Apply
 Apply everything at once:
 ```bash
-# 一次性应用所有清单
-kubectl apply -f k8s/
+#执行本地测试
+kubectl apply -k overlays/local/  
 ```
 
 ### Verify
@@ -219,7 +230,7 @@ kubectl get all -n llm-guard
 kubectl logs -l app=llm-guard-middleware -n llm-guard --tail=50 -f
 
 # Port-forward for local testing
-kubectl port-forward svc/llm-guard-service 8080:80 -n llm-guard
+kubectl port-forward service/llm-guard-service 8000:8000 -n llm-guard
 ```
 
 ```bash
@@ -232,8 +243,6 @@ curl -X POST http://localhost:8080/scan \
   -H "Authorization: Bearer your-auth-token" \
   -d '{"prompt": "Hello, how are you?"}'
 
-# Prometheus metrics
-curl http://localhost:9090/metrics
 ```
 
 Expected healthy response:
@@ -245,4 +254,20 @@ Expected healthy response:
   "latency_ms": 0.8,
   "scanners_triggered": []
 }
+```
+
+### 基准测试
+```text
+测试场景 (Input) |	流量特征|	拦截动作|	预期标准响应 (Actual Result) |	状态
+白名单业务流量 |	正常提示词（如“请写一首诗”）|	放行 | HTTP 200，成功获取下游模型 Llama 返回的文本。|	🟢 PASS
+提示词注入攻击 |	恶意载荷（含 system override 关键字）|	拦截 |	HTTP 200/403，直接阻断并返回本地/生产专有的混淆硬化提示语。| 	🟢 PASS
+探针并发对冲 |	50次/秒 连续高频请求 |	放行	| 网关处理业务的同时，Mock 服务重启次数维持为 0，CPU 时间片未发生死锁。| 	🟢 PASS
+```
+
+### 恶意投毒反制
+```text
+投毒场景 (Attack Vector)| 攻击载荷 (Payload) | 预期反制结果 (Security Enforcement)	| 状态
+运行时内核攻击	| 尝试在网关容器内篡改系统时间 |	命令直接被内核拒绝，报错 Operation not permitted。|	🟢 PASS
+高风险挂载投毒	| 尝试通过 GitOps 部署挂载宿主机根目录（/）的 Pod	| K8s API-Server 依据命名空间 Restricted 策略直接底层硬拦截，拒绝接收资源。	| 🟢 PASS
+原子轮换（网络零中断）| 	在持续压测期间，执行 rollout restart 强行轮换网关	| 结合优雅停机策略，整个交替过程中，压测工具报告的 HTTP 错误率为 0%。	🟢 PASS
 ```

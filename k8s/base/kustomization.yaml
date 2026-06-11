@@ -1,0 +1,33 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - services.yaml
+  - deployment-gateway.yaml
+  - deployment-vllm-mock.yaml
+
+configMapGenerator:
+  # 1. 纯键值环境变量
+  - name: llm-guard-settings
+    namespace: llm-guard
+    literals:
+      - UPSTREAM_URL="http://llamacpp-service:8080"
+      - PORT="8000"
+      - ENABLE_RULE_ENGINE="true"
+      - ENABLE_ML_MODEL="false"
+      - ENABLE_STREAM_GUARD="true"
+      - ENABLE_HOT_RELOAD="false"
+      - ALERT_BLOCK_RATIO_THRESHOLD="0.5"
+  # 2. 纯安全规则文件
+  - name: llm-guard-rules
+    namespace: llm-guard
+    files:
+      - rules.yaml
+
+secretGenerator:
+  - name: llm-guard-secret
+    namespace: llm-guard
+    type: Opaque
+    literals:
+      - SAFE_REPLY_MESSAGE="很抱歉，您的请求包含不当内容，无法处理。"

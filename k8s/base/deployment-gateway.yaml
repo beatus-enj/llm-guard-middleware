@@ -3,57 +3,64 @@ kind: Deployment
 metadata:
   name: llm-guard
   namespace: llm-guard
-  labels:
-    app: llm-guard
 spec:
-  replicas: 2                    # 2 个副本，一个挂了还有一个
+  replicas: 2
   selector:
     matchLabels:
       app: llm-guard
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxSurge: 1                # 更新时最多多启动 1 个新 Pod
-      maxUnavailable: 0          # 更新时不允许有 Pod 不可用（零宕机）
+      maxSurge: 1
+      maxUnavailable: 0
   template:
     metadata:
       labels:
         app: llm-guard
       annotations:
-        prometheus.io/scrape: "true"   # 告诉 Prometheus 来抓这个 Pod
+        prometheus.io/scrape: "true"
         prometheus.io/port: "8000"
         prometheus.io/path: "/metrics"
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: llm-guard
           image: llm-guard:v3
-          imagePullPolicy: Never       # 用本地镜像，不去 registry 拉
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
-          
-          # 环境变量从 ConfigMap 注入
+          # 仅从纯标量配置中导入环境变量，规避规则文本污染
           envFrom:
             - configMapRef:
-                name: llm-guard-config
+                name: llm-guard-settings
             - secretRef:
                 name: llm-guard-secret
-          
-          # rules.yaml 挂载为文件
           volumeMounts:
             - name: rules-volume
               mountPath: /app/config
               readOnly: true
-          
-          # 资源限制：防止一个 Pod 吃满节点资源
+            - name: tmp-volume
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            runAsNonRoot: true
           resources:
             requests:
               memory: "128Mi"
-              cpu: "100m"       # 0.1 个 CPU 核
+              cpu: "100m"
             limits:
               memory: "512Mi"
-              cpu: "500m"       # 最多 0.5 个 CPU 核
-          
-          # 存活探针：失败则重启容器
+              cpu: "500m"
           livenessProbe:
             httpGet:
               path: /guard/health
@@ -61,8 +68,6 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 15
             failureThreshold: 3
-          
-          # 就绪探针：失败则从 Service 摘除（不接收流量）
           readinessProbe:
             httpGet:
               path: /guard/health
@@ -70,14 +75,10 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
             failureThreshold: 2
-      
       volumes:
         - name: rules-volume
           configMap:
-            name: llm-guard-config
-            items:
-              - key: rules.yaml
-                path: rules.yaml
-      
-      # 优雅关闭：SIGTERM 后等 30 秒再强杀
+            name: llm-guard-rules
+        - name: tmp-volume
+          emptyDir: {}
       terminationGracePeriodSeconds: 30
