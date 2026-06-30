@@ -169,7 +169,7 @@ python ../tests/test_v3.py
 
 ## 热更新规则
 
-编辑 `config/rules.yaml`，中间件在 2 秒内自动加载：
+编辑 `config/rules.yaml`，中间件在瞬间自动加载：
 
 ```yaml
 injection_patterns:
