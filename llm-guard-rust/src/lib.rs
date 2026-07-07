@@ -8,9 +8,45 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use serde::Deserialize;
+use unicode_normalization::UnicodeNormalization;
 
 // ════════════════════════════════════════════════════════════════════════════
-//  内置静态规则常量 (新增 DATA EXFILTRATION 过滤器矩阵)
+//  匹配前归一化（新增）
+// ════════════════════════════════════════════════════════════════════════════
+// 仅用于 injection / harmful 匹配路径。exfiltration 路径（信用卡号、API key 等）
+// 不经过此函数处理，避免 leetspeak/大小写归一化破坏敏感数据的原始格式判定。
+fn normalize_for_matching(input: &str) -> String {
+    // 1) 移除零宽字符与 BOM (U+200B ZWSP, U+200C ZWNJ, U+200D ZWJ, U+2060 WORD JOINER, U+FEFF BOM)
+    let no_zero_width: String = input
+        .chars()
+        .filter(|c| !matches!(*c, '\u{200B}'..='\u{200D}' | '\u{FEFF}' | '\u{2060}'))
+        .collect();
+
+    // 2) NFKC 归一化：全角 ASCII → 半角，兼容变体字形统一
+    let nfkc: String = no_zero_width.nfkc().collect();
+
+    // 🔧 新增：优先处理双写 "11" → "ll"（常见于 all/full/still 等词的混淆）
+    let pre_doubled = nfkc.replace("11", "ll");
+
+    // 3) 窄范围 leetspeak 替换（仅替换明确无歧义的数字/符号，避免误伤中文与正常英文数字语境）
+    let leet_replaced: String = pre_doubled
+        .chars()
+        .map(|c| match c {
+            '0' => 'o',
+            '1' => 'i',
+            '3' => 'e',
+            '4' => 'a',
+            '5' => 's',
+            '@' => 'a',
+            other => other,
+        })
+        .collect();
+
+    leet_replaced.to_lowercase()
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  内置静态规则常量 (新增 DATA EXFILTRATION 过滤器矩阵 + 同义改写/跨语言拼接规则)
 // ════════════════════════════════════════════════════════════════════════════
 
 const DEFAULT_INJECTION_PATTERNS: &[&str] = &[
@@ -54,10 +90,18 @@ const DEFAULT_INJECTION_PATTERNS: &[&str] = &[
     r"(开发者|无限制|上帝|超级管理员)模式",
     r"你的(新|真实|实际)(系统|提示词|指令)是",
     r"无视(所有|之前|前面)的?(限制|规则|指令|提示)",
+     // ── 新增：同义改写 ──────────────────────────────────────────────
+    r"(disregard|forgo)\s+(your\s+)?(earlier|prior)\s+(directives?|guidelines?)",
+    r"(ignore|disregard|forgo|override|bypass)\s+(all|your|the)?\s*(previous|earlier|prior|original)\s+(instructions?|directives?|guidelines?|rules?|settings?)",
+    // ── 新增：中文同义改写 ──────────────────────────────────────────
+    r"(忽略|无视|不管|抛开)\s*(之前|先前|上面|以上)?\s*(的)?\s*(指令|指示|设定|规则)",
+    // ── 新增：跨语言拼接（英文动词 + 中文目标词 / 中文动词 + 英文目标词）──
+    r"ignore.{0,15}(指令|指示|设定)",
+    r"(忽略|无视).{0,15}(instructions?|guidelines?|rules?)",
 ];
 
 const DEFAULT_HARMFUL_PATTERNS: &[&str] = &[
-    r"how\s+to\s+(make|build|create|synthesize|manufacture|construct)\s+(a\s+)?(bomb|explosive|weapon|grenade|mine|explosive\s+device|ied)",
+    r"how\s+to\s+(make|build|create|synthesize|manufacture|construct)\s+(a\s+)?(c4|bomb|explosive|weapon|grenade|mine|explosive\s+device|ied)",
     r"(build|construct|assemble|make)\s+(an?\s+)?(explosive|improvised\s+explosive|ied|pipe\s+bomb|car\s+bomb)",
     r"synthesis\s+(of|route\s+for)\s+(meth(amphetamine)?|heroin|fentanyl|explosives?|sarin|vx\s+nerve)",
     r"(how\s+(do\s+i|to)\s+)?(synthesize|make|produce)\s+(meth(amphetamine)?|heroin|fentanyl|cocaine|mdma)",
@@ -98,6 +142,11 @@ const DEFAULT_INJECTION_KEYWORDS: &[&str] = &[
     "提示词注入", "越狱", "绕过审查", "无限制模式",
     "bypass your training", "your real instructions",
     "hidden prompt", "system override",
+     // ── 新增：同义改写关键词 ──
+    "disregard your earlier directives",
+    "forgo your prior guidelines",
+    "忽略你之前的指示",
+    "无视先前的设定",
 ];
 
 // 🚀 新增：确定性数据泄露敏感词
@@ -169,9 +218,13 @@ fn compile_rules(config_path: &str) -> Result<InnerRules, String> {
 
     let compile_regex = |patterns: Vec<String>| -> Option<Regex> {
     if patterns.is_empty() { return None; }
-    let joined = patterns.iter().map(|p| format!("(?:{})", p)).collect::<Vec<_>>().join("|");
+    let valid: Vec<String> = patterns.into_iter()
+        .filter(|p| Regex::new(p).is_ok())  // 逐条预校验，过滤掉编译失败的
+        .collect();
+    if valid.is_empty() { return None; }
+    let joined = valid.iter().map(|p| format!("(?:{})", p)).collect::<Vec<_>>().join("|");
     Regex::new(&format!("(?is){}", joined)).ok()
-    };
+};
 
     Ok(InnerRules {
         inj_ac, inj_keywords: inj_kw, inj_regex: compile_regex(inj_p),
@@ -185,15 +238,18 @@ impl InnerRules {
     fn check_text<'py>(&self, py: Python<'py>, text: &str) -> PyResult<Bound<'py, PyDict>> {
         let dict = PyDict::new_bound(py);
 
+        // 🔧 归一化文本：仅用于 injection / harmful 匹配，去零宽字符 + NFKC + 窄范围 leetspeak
+        let normalized = normalize_for_matching(text);
+
         // 1. 提示词注入关键词快速路径
         if let Some(ref ac) = self.inj_ac {
-            if let Some(mat) = ac.find(text) {
+            if let Some(mat) = ac.find(&normalized) {
                 return self.build_blocked_dict(dict, "prompt_injection", format!("关键词匹配: '{}'", &self.inj_keywords[mat.pattern().as_usize()]));
             }
         }
         // 2. 提示词注入正则路径
         if let Some(ref re) = self.inj_regex {
-            if let Some(mat) = re.find(text) {
+            if let Some(mat) = re.find(&normalized) {
                 return self.build_blocked_dict(dict, "prompt_injection", format!("注入正则命中: '{}'", mat.as_str().chars().take(40).collect::<String>()));
             }
         }
@@ -209,15 +265,17 @@ impl InnerRules {
                 return self.build_blocked_dict(dict, "data_exfiltration", format!("敏感资产凭证外泄: '{}'", mat.as_str().chars().take(40).collect::<String>()));
             }
         }
-        // 5. 有害内容关键词路径
+        // 5. 有害内容关键词路径 —— 归一化文本 + 原始文本都试，任一命中即拦截
         if let Some(ref ac) = self.harm_ac {
-            if let Some(mat) = ac.find(text) {
+            let hit = ac.find(&normalized).or_else(|| ac.find(text));
+            if let Some(mat) = hit {
                 return self.build_blocked_dict(dict, "harmful_content", format!("有害关键词: '{}'", &self.harm_keywords[mat.pattern().as_usize()]));
             }
         }
-        // 6. 有害内容正则路径
+        // 6. 有害内容正则路径 —— 同样两边都试
         if let Some(ref re) = self.harm_regex {
-            if let Some(mat) = re.find(text) {
+            let hit = re.find(&normalized).or_else(|| re.find(text));
+            if let Some(mat) = hit {
                 return self.build_blocked_dict(dict, "harmful_content", format!("有害内容正则命中: '{}'", mat.as_str().chars().take(40).collect::<String>()));
             }
         }
